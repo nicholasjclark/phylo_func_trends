@@ -1,4 +1,4 @@
-# To what extent phylogenetic or functional relationships among species can be leveraged to inform estimates of nonlinear changes in abundance?
+# To what extent can phylogenetic or functional relationships among species be leveraged to inform estimates of nonlinear changes in abundance?
 
 This study aims to use long-term multi-species monitoring data to tackle the above question. 
 
