@@ -16,6 +16,8 @@ This study aims to use long-term multi-species monitoring data to tackle the abo
 
 [Hammed Akande](https://github.com/drhammed)
 
+[Guillermo Fandos](https://github.com/guifandos)
+
 ## Proposed methodology
 1. Gather multi-species abundance (or relative abundance) measures from long-term monitoring studies
 2. Construct phylogenetic and functional trees to represent relationships among species
