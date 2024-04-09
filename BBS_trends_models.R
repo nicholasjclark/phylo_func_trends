@@ -72,6 +72,14 @@ mod <- bam(count ~
                 xt = list(list(penalty = NULL),
                           list(nb = strat_penalty), 
                           list(penalty = phylo_penalty)),
+                k = c(10, 20, 20)) +
+             
+             # Non-phylogenetic spatiotemporal effects
+             ti(year, ST_12, sp_latin, 
+                bs = c('cr', 'mrf', 'mrf'),
+                xt = list(list(penalty = NULL),
+                          list(nb = strat_penalty), 
+                          list(penalty = sp_penalty)),
                 k = c(10, 20, 20)),
            
            # Residual AR1 parameter to apply to working residuals;

@@ -1,4 +1,8 @@
 #### Post-processing ####
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(marginaleffects)
 
 # Source a few utility functions
 source('Functions/utilities.R')
@@ -27,13 +31,13 @@ plot_trait_conts(trait_derivs = phylo_derivs,
 
 # Proportion of trends in which phylogenetic information contributes at
 # least 50% to the estimated wiggliness of the function compared to 
-# other information (i.e. spatial variation)
+# other information (i.e. spatial and non-phylogenetic variation)
 phylo_derivs %>%
   # Filter out those with very small wiggliness estimates, as 
   # the contributions don't add any meaningful information here
   # because the estimated trend is flat
   dplyr::filter(wiggliness >= quantile(wiggliness, probs = 0.15)) %>%
-  dplyr::summarise(prop = length(which(trait_conts >= 0.5)) / 
+  dplyr::summarise(prop = 100 * length(which(trait_conts >= 0.5)) / 
                      dplyr::n())
 
 # Repeat for the functional relatedness model
@@ -45,7 +49,7 @@ plot_trait_conts(trait_derivs = func_derivs,
                  type = 'functional')
 func_derivs %>%
   dplyr::filter(wiggliness >= quantile(wiggliness, probs = 0.15)) %>%
-  dplyr::summarise(prop = length(which(trait_conts >= 0.5)) / 
+  dplyr::summarise(prop = 100 * length(which(trait_conts >= 0.5)) / 
                      dplyr::n())
 
 # Plot some predictions against truth (note, these predictions will not include
@@ -111,7 +115,7 @@ plot_av_trend(model = mod, mod_data = mod_data,
 
 # Will need to:
 # 1. fit simpler models that ignore all relationship information, as 
-#    well as phylogenetic slopes (linear) models for comparisons
+#    well as phylogenetic/functional slopes (linear) models for comparisons
 # 2. leave 10% of combos (strata x species) out and generate
 #    predictions; compute CRPS from each model; run several CV folds
 # 3. assess variation in prediction accuracy across space and 

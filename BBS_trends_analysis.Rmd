@@ -1,0 +1,230 @@
+---
+title: "Example BBS trends analysis"
+subtitle: '83 species from 1992 - 2021'
+author: Nicholas Clark, School of Veterinary Science, University of Queensland^[n.clark@uq.edu.au, https://github.com/nicholasjclark]
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{css, echo=FALSE}
+details > summary {
+  padding: 4px;
+  background-color: #8F2727;
+  color: white;
+  border: none;
+  box-shadow: 1px 1px 2px #bbbbbb;
+  cursor: pointer;
+}
+
+details > summary:hover {
+  background-color: #DCBCBC;
+  color: #8F2727;
+}
+
+.scroll-300 {
+  max-height: 300px;
+  overflow-y: auto;
+  background-color: inherit;
+}
+
+h1, #TOC>ul>li {
+  color: #8F2727;
+}
+
+h2, #TOC>ul>ul>li {
+  color: #8F2727;
+}
+
+h3, #TOC>ul>ul>li {
+  color: #8F2727;
+}
+
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    z-index: 2;
+    color: #fff;
+    background-color: #DCBCBC;
+    border-color: #DCBCBC;
+}
+
+a {
+    color: purple;
+    font-weight: bold;
+}
+
+a:hover {
+    color: #C79999;
+}
+
+::selection {
+  background: #DCBCBC;
+  color: #8F2727;
+}
+
+.button_red {
+  background-color: #8F2727;
+  border: #8F2727;
+  color: white;
+}
+
+.button_red:hover {
+  background-color: #DCBCBC;
+  color: #8F2727;
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,   
+  dpi = 150,
+  fig.asp = 0.8,
+  fig.width = 6,
+  out.width = "60%",
+  fig.align = "center")
+```
+
+## Source libraries
+```{r include=FALSE}
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(marginaleffects)
+source('Functions/utilities.R')
+```
+
+```{r eval=FALSE}
+library(mgcv)
+library(dplyr)
+library(ggplot2)
+library(marginaleffects)
+source('Functions/utilities.R')
+```
+
+```{r, class.output="scroll-300"}
+sessionInfo()
+```
+
+## Model summary and AIC calculation
+```{r}
+load("./data/model_objects.rda")
+mod <- readRDS("./models/mod.rds")
+```
+
+Don't run full `mgcv` summaries; they are extremely computationally expensive for these models
+```{r}
+summary(mod, re.test = FALSE)
+```
+
+AIC is available, if we choose to use it
+```{r}
+AIC(mod)
+```
+
+## Contributions to 'wiggliness'
+Calculate phylogenetic contributions to species' nonlinear trend estimates. This works by taking advantage of the `predict.gam(type = 'terms', ...)` functionality in `mgcv`. Essentially we compute the partial contribution of *each* term in the fitted model to the nonlinear trend estimate for each species x region combination. Summing these contributions gives the trend estimate for each row in `newdata`, while taking the squared second derivative of this sum gives the *slope of the slope* for each row. If we sum these squared second derivatives we arrive at a useful definition of "wiggliness". The idea of the `compute_derivs()` function is to do this while either excluding phylogenetic terms or excluding all terms apart from the phylogenetic terms. This allows us to isolate the partial contribution of phylogeny to the overall wigliness (i.e. nonlinearity) of a species' trend estimate. It is computationally expensive so I operate over 8 cores here
+```{r}
+phylo_derivs <- compute_derivs(mod_data,
+                               model = mod,
+                               type = 'phylogenetic',
+                               n_cores = 8)
+```
+
+There is also a work-in-progress plotting routine for the returned object. In this plot, bluer shades show higher contributions of phylogeny, while redder shades show smaller contributions of phylogeny. They are plotted on the log scale, so a value of `0` means phylogeny contributes equally compared to all other non-phylogenetic components (space and non-phylogenetic relationships)
+```{r}
+plot_trait_conts(trait_derivs = phylo_derivs,
+                 type = 'phylogenetic')
+```
+
+We can see that, indeed for some species phylogeny plays a sizeable role. Here I compute the proportion of trends in which phylogenetic information contributes at least 50% to the estimated wiggliness of the function compared to other information (i.e. spatial and non-phylogenetic variation). This is an arbitrary threshold of course
+```{r}
+phylo_derivs %>%
+  # Filter out those with very small wiggliness estimates, as 
+  # the contributions don't add any meaningful information here
+  # because the estimated trend is flat
+  dplyr::filter(wiggliness >= quantile(wiggliness, probs = 0.15)) %>%
+  dplyr::summarise(prop = 100 * length(which(trait_conts >= 0.5)) / 
+                     dplyr::n())
+```
+
+## Plotting trends
+Plot some predictions against truth (note, these predictions will not include contributions from the residual AR process). The `plot_sp_trends()` function will take the supplied data and compute predictions that include the offset terms, so what we are seeing is a combination of the estimated trend and the supplied offset. We can supply specific regions we'd want, but I'm just using the default here. These give us a sense of whether the model has done a reasonable job of capturing the complexity of the observations. For some species it is clear that we'd need more complexity (i.e. higher `k` values for some of the smooth terms)
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = 'Hirundo_rustica',
+               type = 'response',
+               median_records = FALSE)
+```
+
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = levels(mod_data$sp_latin)[8],
+               type = 'response',
+               median_records = FALSE)
+```
+
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = levels(mod_data$sp_latin)[9],
+               type = 'response',
+               median_records = FALSE)
+```
+
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = levels(mod_data$sp_latin)[30],
+               type = 'response',
+               median_records = FALSE)
+```
+
+We can also plot some expected trends by fixing the offsets and asking how the model would expect species' abundances to change over time. This is a more useful way of asking what the estimated trend is for each species x region combination, because it gives what the model would expect to see if we had a standardized sampling effort per year
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = 'Hirundo_rustica',
+               type = 'expected',
+               median_records = TRUE)
+```
+
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = levels(mod_data$sp_latin)[8],
+               type = 'expected',
+               median_records = TRUE)
+```
+
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = levels(mod_data$sp_latin)[9],
+               type = 'expected',
+               median_records = TRUE)
+```
+
+```{r}
+plot_sp_trends(model = mod,
+               data = mod_data,
+               species = levels(mod_data$sp_latin)[30],
+               type = 'expected',
+               median_records = TRUE)
+```
+
+
+Finally, we can compute some attempt at an "average" temporal trend for the last 25 years of data. I use only 65% of species to save computational time, but of course including more species would give a more accurate estimate of the "average" expected trend. Note that this has been zero-centred for interpretability
+```{r}
+plot_av_trend(model = mod, mod_data = mod_data, 
+              prop_species = 0.65)
+```
+
+## To do:
+1. fit simpler models that ignore all relationship information, as well as phylogenetic/functional slopes (linear) models for comparisons  
+2. leave 10% of combos (strata x species) out and generate predictions; compute CRPS from each model; run several CV folds  
+3. assess variation in prediction accuracy across space and across the trees  
+4. visualise the proportional change in variance explained (as calculated above) on the tree to see if there are clusters of species that depend more heavily on phylogenetic relationships  
+5. assess support for nonlinearity of trends; determine when trends were accelerating / decelerating most rapidly
+
