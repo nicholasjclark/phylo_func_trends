@@ -43,11 +43,44 @@ biotime2 <- biotime %>% dplyr::select(study_id, latitude, longitude, year, plot,
            "Density" ~ "density"
          )) %>% 
   dplyr::rename(date = year, species = genus_species, abundance = sum_allrawdata_abundance) %>% 
-  dplyr::select(dataset_id, site, country, latitude, longitude, date, species, abundance, unit)
+  dplyr::select(dataset_id, study_id, site, country, latitude, longitude, date, species, abundance, unit)
 
 
 # explore data ------------------------------------------------------------
 
 str(biotime_meta)
-hist(biotime_meta$number_of_species, breaks = 1000)
-dplyr::filter(biotime_meta, number_of_species > 4000)
+
+#how many studies of each taxonomic group
+ggplot(biotime_meta, aes(taxa)) +
+  geom_bar() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  
+#log(number of locations) - many are single location
+hist(log(biotime_meta$number_lat_long), breaks = 50)
+
+#log(number of species)
+hist(log(biotime_meta$number_of_species), breaks = 50)
+
+#filter based on arbitrary thresholds
+biotime_meta_f <- dplyr::filter(biotime_meta, 
+              number_lat_long >= 10,
+              number_of_species >= 10,
+              #time points
+              data_points >= 25,
+              taxa %in% c('Birds',
+                          'Mammals',
+                          'Amphibians',
+                          'Terrestrial plants',
+                          'Fish'))
+
+#how many studies of each taxonomic group for filtered data
+ggplot(biotime_meta_f, aes(taxa)) +
+  geom_bar() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+str(biotime_meta_f)
+biotime_meta_f$title
+biotime_meta_f$methods
+
