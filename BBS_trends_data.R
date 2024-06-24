@@ -22,104 +22,99 @@ if(!bbsBayes2::have_bbs_data(quiet = TRUE)){
 # Load the full bbs dataset
 all_dat <- bbsBayes2::load_bbs_data()
 
-  counts <- all_dat$birds %>%  # positive counts of each species during every BBS survey
-      select(route_data_id,aou,species_total) #dropping all but the critical columns
-  
-  sampling_events <- all_dat$routes %>%  # date, time, starting location, for every BBS survey since 1966
-      select(country,state,st_abrev,route_name,bcr,
-             country_num,state_num,route,
-             latitude,longitude,
-             route_data_id, #this is the critical unique id for a sampling event
-             year,month,day,obs_n)
+counts <- all_dat$birds %>%  # positive counts of each species during every BBS survey
+  dplyr::select(route_data_id, aou, species_total) #dropping all but the critical columns
 
-  species_list <- all_dat$species %>% # species list
+sampling_events <- all_dat$routes %>%  # date, time, starting location, for every BBS survey since 1966
+  dplyr::select(country, state, st_abrev, route_name, bcr,
+         country_num, state_num,route,
+         latitude, longitude,
+         route_data_id, #this is the critical unique id for a sampling event
+         year, month, day,obs_n)
+
+species_list <- all_dat$species %>% # species list
   dplyr::filter(unid_combined == FALSE,
-                !(grepl("^(unid.)",english) | grepl("^(hybrid)",english) )) %>%  #this is specific to the BBS,
-                select(aou,english,french,genus,species) %>%  # the TRUE option combines 13 taxonomic units that have been split or
-                mutate(latin = paste(genus,species)) # lumped over the history of the BBS, this approach (== FALSE) retains the taxonomic
+                !(grepl("^(unid.)", english) | grepl("^(hybrid)", english) )) %>%  #this is specific to the BBS,
+  dplyr::select(aou, english, french, genus, species) %>%  # the TRUE option combines 13 taxonomic units that have been split or
+  dplyr::mutate(latin = paste(genus, species)) # lumped over the history of the BBS, this approach (== FALSE) retains the taxonomic
 # units, exactly as they are stored in the BBS database
 
+luni <- function(x){
+  y <- length(unique(x))
+}
 
-  luni <- function(x){
-    y <- length(unique(x))
-  }
-  
-  
 # strata loop to limit species lists by strata ----------------------------
 #setting limits on the strata that are included
 more_than_n_routes_stratum <- 10 # More than this number of BBS routes in the stratum
 more_than_n_surveys_stratum <- 200 # More than this number of surveys (routes * years) in the stratum
-  
-  strata_list <- sampling_events %>% 
-    group_by(bcr) %>% 
-    summarise(.,
-              n_surveys = n(),
-              n_routes = luni(route_name)) %>% 
-    filter(n_routes > more_than_n_routes_stratum, #filter on the total number of routes (sampling locations)
-           n_surveys > more_than_n_surveys_stratum) #filter on the total number of sampling events
-                          #seems high, but it's only ~4 surveys annually (low for such large regions)
-                        # above drops BCR1 and BCR3
+
+strata_list <- sampling_events %>% 
+  dplyr::group_by(bcr) %>% 
+  dplyr::summarise(.,
+            n_surveys = dplyr::n(),
+            n_routes = luni(route_name)) %>% 
+  dplyr::filter(n_routes > more_than_n_routes_stratum, #filter on the total number of routes (sampling locations)
+         n_surveys > more_than_n_surveys_stratum) #filter on the total number of sampling events
+#seems high, but it's only ~4 surveys annually (low for such large regions)
+# above drops BCR1 and BCR3
                         
+data_all <- NULL # empty object to facilitate bind_rows() at the end of the next loop
+
+# this strata-specific approach removes the species by strata
+# combinations in the data that are exclusively 0-values. 
+# Species are only included in a given strata, if they meet the 
+# following inclusion criteria:
+more_than_n_counts_species <- 100 
+# More than this number of surveys (routes * years) on which the species has been observed
+# this is probably too low... only ~2 counts/year 
+
+for(reg in strata_list$bcr){
+  samp_ev_select <- sampling_events %>% 
+    dplyr::filter(bcr == reg)
   
-  data_all <- NULL # empty object to facilitate bind_rows() at the end of the next loop
+  counts_select <- counts %>% 
+    dplyr::filter(route_data_id %in% samp_ev_select$route_data_id)
   
-  # this strata-specific approach removes the species by strata
-  # combinations in the data that are exclusively 0-values. 
-  # Species are only included in a given strata, if they meet the 
-  # following inclusion criteria:
-  more_than_n_counts_species <- 100 
-  # More than this number of surveys (routes * years) on which the species has been observed
-  # this is probably too low... only ~2 counts/year 
+  # counting number of observations of each species
+  species_inc <- counts_select %>% 
+    dplyr::group_by(aou) %>% 
+    dplyr::summarise(.,
+              n_obs = dplyr::n()) #n_obs represents the number of non-zero counts across routes and year
   
-  for(reg in strata_list$bcr){
-    samp_ev_select <- sampling_events %>% 
-      filter(bcr == reg)
-    
-    counts_select <- counts %>% 
-      filter(route_data_id %in% samp_ev_select$route_data_id)
-    
-    # counting number of observations of each species
-    species_inc <- counts_select %>% 
-      group_by(aou) %>% 
-      summarise(.,
-                n_obs = n()) #n_obs represents the number of non-zero counts across routes and year
-    
-    #identifying which species to keep (n_obs > more_than_n_counts_species)
-    species_keep <- species_inc %>% 
-      filter(n_obs > more_than_n_counts_species) %>%  
-      select(aou)
-     
-    # complete set of species by surveys
-    samp_ev_select <- samp_ev_select %>% 
-      expand_grid(.,species_keep)
-    # above creates a complete set of species by survey combinations
-    
-    #zero-filling
-    data_sel <- samp_ev_select %>% 
-      full_join(.,counts_select,
-                by = c("route_data_id",
-                       "aou")) %>% 
-      mutate(species_total = ifelse(is.na(species_total),
-                                 0,
-                                 species_total))
-    # above creates the full set of observations with appropriate zero values for
-    # the species in species_keep at all surveys conducted in the region
-    
-    
-    data_all <- bind_rows(data_all,
-                          data_sel)
-    rm(data_sel)
-    
-    
-  }  
+  #identifying which species to keep (n_obs > more_than_n_counts_species)
+  species_keep <- species_inc %>% 
+    dplyr::filter(n_obs > more_than_n_counts_species) %>%  
+    dplyr::select(aou)
   
-  data_all <- data_all %>% 
-    left_join(.,species_list,
-              by = "aou")
-  n_species = length(unique(data_all$english))
- 
+  # complete set of species by surveys
+  samp_ev_select <- samp_ev_select %>% 
+    expand_grid(., species_keep)
+  # above creates a complete set of species by survey combinations
   
-   saveRDS(data_all, "BBS_data/All_BBS_data_by_BCR.rds")
+  #zero-filling
+  data_sel <- samp_ev_select %>% 
+    dplyr::full_join(.,counts_select,
+              by = c("route_data_id",
+                     "aou")) %>% 
+    dplyr::mutate(species_total = ifelse(is.na(species_total),
+                                  0,
+                                  species_total))
+  # above creates the full set of observations with appropriate zero values for
+  # the species in species_keep at all surveys conducted in the region
+  
+  
+  data_all <- dplyr::bind_rows(data_all,
+                        data_sel)
+  rm(data_sel)
+}  
+
+data_all <- data_all %>% 
+  dplyr::left_join(.,species_list,
+            by = "aou")
+n_species = length(unique(data_all$english))
+
+dir.create('BBS_data', recursive = TRUE, showWarnings = FALSE)
+saveRDS(data_all, "BBS_data/All_BBS_data_by_BCR.rds")
 
 
 
@@ -128,13 +123,11 @@ all_data <- data_all %>%
   rename(route_id = route_name,
          sp_latin = latin,
          count = species_total) %>% 
-  mutate(strata_name = paste0("BCR",bcr)) %>%  #to match the strata names in the bcr map below
-  filter(year > 1991)
+  dplyr::mutate(strata_name = paste0("BCR", bcr)) %>%  #to match the strata names in the bcr map below
+  dplyr::filter(year > 1991)
 ## 12 Million rows in above
 
-
 head(all_data)
-
 length(unique(all_data$english))
 # 476 species
 
@@ -208,15 +201,15 @@ tmp <- all_data_sub %>%
 
 # Add functional trait information using the EltonTraits bird
 # dataset of Wilman et al 2014 (10.1890/13-1917.1)
-# temp <- tempfile()
-# download.file('https://ndownloader.figshare.com/files/5631081',
-#               temp)
-# traits <- read.table(temp, header = TRUE, 
-#                      fill = TRUE, 
-#                      quote = '"',
-#                      stringsAsFactors = FALSE,
-#                      sep = "\t")
-# unlink(temp)
+temp <- tempfile()
+download.file('https://ndownloader.figshare.com/files/5631081',
+              temp)
+traits <- read.table(temp, header = TRUE,
+                     fill = TRUE,
+                     quote = '"',
+                     stringsAsFactors = FALSE,
+                     sep = "\t")
+unlink(temp)
 
 
 # Join the data together and filter out any species that don't have
@@ -239,7 +232,7 @@ tr <- ape::compute.brlen(tr)
 
 # Save the full phylogenetic tree and trait database, which may be useful
 # for later plotting
- dir.create('data')
+dir.create('data', recursive = TRUE, showWarnings = FALSE)
 saveRDS(tr, "./data/tree.rds")
 saveRDS(traits, "./data/traits.rds")
 
@@ -346,25 +339,32 @@ mod_data %>%
   # Number of observations per region x time combo
   dplyr::mutate(n_records = log(n_records + 1)) %>%
   
-  # Empirical mean (logged) of counts per species x region combo
+  # Standardizing counts to zero-centred, unit variance; this is 
+  # probably a necessary evil to ensure we can validate out of sample
+  # predictions of trend trajectories
   dplyr::group_by(sp_latin, strata_name) %>%
-  dplyr::mutate(sp_st_mean = logmean(count)) %>%
-  dplyr::ungroup() %>%
-  
-  # Use both of these to form the offset so we can avoid 
-  # specifying large random effects just to estimate spatial
-  # variation in species' average counts
-  dplyr::mutate(offset = sp_st_mean + n_records,
-                offset_alt = n_records) -> mod_data
-# if the offset adjusts for mean counts in a stratum, what does the phylo
-# or spatial intercepts represent?
-sp_by_bcr <- mod_data %>% 
-group_by(sp_latin,strata_name) %>% 
-  summarise(n_obs = n(),
-            n_zero = length(which(count == 0)))
+  dplyr::mutate(mean_est = mean(count, na.rm = TRUE),
+                sd_est = sd(count, na.rm = TRUE)) %>%
+  dplyr::mutate(count_sc = (count - mean_est) / sd_est) %>%
+  dplyr::ungroup() -> mod_data
 
-# ## could consider dropping all species with n_zero == 30 (number of years)
+# Drop species * region combinations that were all zeros 
 # to remove the stable-at-zero trajectories
+sp_by_bcr <- mod_data %>% 
+  group_by(sp_latin,strata_name) %>% 
+  summarise(n_obs = n(),
+            n_zero = length(which(count == 0))) %>%
+  dplyr::mutate(keep = n_zero < n_obs) %>%
+  dplyr::ungroup()
+
+mod_data %>%
+  dplyr::left_join(sp_by_bcr) %>%
+  dplyr::filter(keep == TRUE) %>%
+  # Add a factor to capture any remaining variation in species' 
+  # spatially-varying intercepts
+  dplyr::mutate(strat_sp  = interaction(strata_name, sp_latin)) %>%
+  droplevels() -> mod_data
+rm(sp_by_bcr)
 
 # Save all data objects
 save(mod_data, phylo_penalty, 

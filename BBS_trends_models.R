@@ -1,161 +1,254 @@
 #### Fit candidate phylogenetic and functional smoothing models
 # to the full dataset ####
 library(mgcv)
-library(MRFtools)
 library(dplyr)
-library(ggplot2)
-library(marginaleffects)
-library(patchwork)
 
 # Load data objects
 load("./data/model_objects.rda")
 
+# Source a few utility functions
+source('Functions/utilities.R')
+
+# Randomly drop 10% of species * region combinations for using as a 
+# validation set
+all_sp_combos <- mod_data %>%
+  dplyr::select(sp_latin, strata_name) %>%
+  dplyr::distinct()
+
+validation_combos <- all_sp_combos %>%
+  dplyr::slice_sample(prop = 0.1) %>%
+  dplyr::mutate(training = 'No')
+
+mod_data <- validation_combos %>%
+  dplyr::right_join(mod_data) %>%
+  dplyr::mutate(training = ifelse(is.na(training), 'Yes', 'No'))
+
+training_data <- mod_data %>%
+  dplyr::filter(training == 'Yes')
+
+validation_data <- mod_data %>%
+  dplyr::filter(training == 'No')
+rm(validation_combos, all_sp_combos)
+
+# Save the training splits
+save(training_data,
+        validation_data,
+        file = "./data/training_split.rds")
+
 # Some useful details on MRF smooths:
 # https://stats.stackexchange.com/questions/638522/gam-model-with-spatial-account-via-mrf
 
-# Fit a phylogenetic trend model using a Poisson observation
+# Fit a phylogenetic trend model uses a Gaussian observation
 # process. The model is a decomposition that includes terms capturing 
 # marginal spatial and spatiotemporal fields, as well as contributions
 # from species' phylogenetic relationships. Higher-order interaction terms
 # allow each species' spatiotemporal field to be informed by phylogeny
-mod <- bam(count ~ 
-             ## First order effects ##
+ptm <- proc.time()
+mod <- bam(count_sc ~ 
              
-             # Offset to account for variation in number of routes
-             # per region per year AND species' empirical means over
-             # regions
-             offset(offset) + 
+             ## First order effects ##
+             # No need for a global intercept
+             0 + 
+             
+             # Account for variation in number of routes per region per year
+             n_records + 
              
              # Primary smooth of year
              s(year, bs = 'cr', k = 10) +
              
-             # Phylogenetically-informed intercepts
-             s(sp_latin_phy, 
-               bs = 'mrf', 
-               xt = list(penalty = phylo_penalty),
-               k = 20) +
-             
-             # Primary average spatial field
-             s(ST_12, 
-               bs = 'mrf', 
-               xt = list(nb = strat_penalty),
-               k = 20) +
-             
              ## Second order effects ##
              
-             # Average spatiotemporal trend
-             ti(year, ST_12, 
+             # Non-phylogenetic average spatiotemporal pattern
+             ti(year, strata_name, 
                 bs = c('cr', 'mrf'),
                 xt = list(list(penalty = NULL), 
                           list(nb = strat_penalty)),
-                k = c(10, 20)) +
-             
-             # Phylogenetically-informed spatial fields
-             ti(ST_12, sp_latin_phy, 
-                bs = c('mrf', 'mrf'),
-                xt = list(list(nb = strat_penalty), 
-                          list(penalty = phylo_penalty)),
-                k = c(20, 20)) +
+                k = c(10, 25)) +
              
              # Phylogenetically-informed average temporal trends
              ti(year, sp_latin_phy, 
                 bs = c('cr', 'mrf'),
                 xt = list(list(penalty = NULL), 
                           list(penalty = phylo_penalty)),
-                k = c(10, 20)) +
+                k = c(10, 25)) +
+             
+             # Non-phylogenetic average temporal trends
+             ti(year, sp_latin, 
+                bs = c('cr', 'mrf'),
+                xt = list(list(penalty = NULL), 
+                          list(penalty = sp_penalty)),
+                k = c(10, 25)) +
              
              ## Third order effects ##
              
              # Phylogenetically-informed spatiotemporal effects
-             ti(year, ST_12, sp_latin_phy, 
+             ti(year, strata_name, sp_latin_phy,
                 bs = c('cr', 'mrf', 'mrf'),
                 xt = list(list(penalty = NULL),
-                          list(nb = strat_penalty), 
+                          list(nb = strat_penalty),
                           list(penalty = phylo_penalty)),
-                k = c(10, 20, 20)) +
-             
+                k = c(10, 25, 25)) +
+
              # Non-phylogenetic spatiotemporal effects
-             ti(year, ST_12, sp_latin, 
+             ti(year, strata_name, sp_latin,
                 bs = c('cr', 'mrf', 'mrf'),
                 xt = list(list(penalty = NULL),
-                          list(nb = strat_penalty), 
+                          list(nb = strat_penalty),
                           list(penalty = sp_penalty)),
-                k = c(10, 20, 20)),
-           
-           # Residual AR1 parameter to apply to working residuals;
-           # we expect some autocorrelation but unfortunately cannot estimate
-           # this parameter. 0.3 seems like a reasonable compromise
-           rho = 0.3,
-           
-           # Logical variable telling bam() where each time series
-           # begins, ensuring the AR1 process is applied appropriately
-           # (only works if data are arranged properly)
-           AR.start = mod_data$year == min(mod_data$year),
-           
-           # Poisson observations because we don't expect each species
-           # to share the same level of overdispersion, as would be assumed
-           # in a Negative Binomial or Tweedie model
-           family = poisson(),
-           data = mod_data,
+                k = c(10, 25, 25)),
+           family = gaussian(),
+           data = training_data,
            method = 'fREML',
+           select = TRUE,
            drop.unused.levels = FALSE,
            discrete = TRUE,
            
            # Adjust appropriately; I'm using a beefy i9 processor
-           # and this model takes ~15 - 20 minutes to complete
-           nthreads = 15)
+           # and this model takes ~90 - 120 minutes to complete
+           nthreads = 12)
+runtime <- proc.time() - ptm
+gc()
+mod$runtime <- runtime
 
-# Add draws of posterior coefficients so this only needs to be done once, and
-# then save the model object
+# Reduce model size and add draws of posterior coefficients
+mod <- post_process(mod)
+
+# Save the model object
 dir.create('models')
-mod$coef_posterior <- rmvn(500,
-                           mu = coef(mod),
-                           V = mod$Vp)
 saveRDS(mod, "./models/mod.rds")
+
+# Now for two benchmark variants of model 1. Benchmark 1 ignores the phylogenetic 
+# components but still allows for nonlinear trends
+ptm <- proc.time()
+mod_bench1 <- bam(count_sc ~ 
+                    0 + 
+                    n_records + 
+                    s(year, bs = 'cr', k = 10) +
+                    ti(year, strata_name, 
+                       bs = c('cr', 'mrf'),
+                       xt = list(list(penalty = NULL), 
+                                 list(nb = strat_penalty)),
+                       k = c(10, 25)) +
+                    ti(year, sp_latin, 
+                       bs = c('cr', 'mrf'),
+                       xt = list(list(penalty = NULL), 
+                                 list(penalty = sp_penalty)),
+                       k = c(10, 25)) +
+                    ti(year, strata_name, sp_latin,
+                       bs = c('cr', 'mrf', 'mrf'),
+                       xt = list(list(penalty = NULL),
+                                 list(nb = strat_penalty),
+                                 list(penalty = sp_penalty)),
+                       k = c(10, 25, 25)),
+                  family = gaussian(),
+                  data = training_data,
+                  method = 'fREML',
+                  select = TRUE,
+                  drop.unused.levels = FALSE,
+                  discrete = TRUE,
+                  nthreads = 12)
+runtime <- proc.time() - ptm
+gc()
+mod_bench1$runtime <- runtime
+mod_bench1 <- post_process(mod_bench1)
+saveRDS(mod_bench1, "./models/mod_bench1.rds")
+
+# The second benchmark allows for phylogenetic and non-phylogenetic 
+# slopes but assumes the trend is linear
+ptm <- proc.time()
+mod_bench2 <- bam(count_sc ~ 
+                    0 + 
+                    n_records + 
+                    # Feeding in large smoothing penalties will regularise
+                    # smooths back to linear functions
+                    s(year, bs = 'cr', k = 3, sp = .Machine$double.xmax) +
+                    ti(year, strata_name, 
+                       bs = c('cr', 'mrf'),
+                       xt = list(list(penalty = NULL), 
+                                 list(nb = strat_penalty)),
+                       k = c(3, 25),
+                       sp = c(.Machine$double.xmax, -1)) +
+                    ti(year, sp_latin_phy, 
+                       bs = c('cr', 'mrf'),
+                       xt = list(list(penalty = NULL), 
+                                 list(penalty = phylo_penalty)),
+                       k = c(13, 25),
+                       sp = c(.Machine$double.xmax, -1)) +
+                    ti(year, sp_latin, 
+                       bs = c('cr', 'mrf'),
+                       xt = list(list(penalty = NULL), 
+                                 list(penalty = sp_penalty)),
+                       k = c(3, 25),
+                       sp = c(.Machine$double.xmax, -1)) +
+                    ti(year, strata_name, sp_latin_phy,
+                       bs = c('cr', 'mrf', 'mrf'),
+                       xt = list(list(penalty = NULL),
+                                 list(nb = strat_penalty),
+                                 list(penalty = phylo_penalty)),
+                       k = c(3, 25, 25),
+                       sp = c(.Machine$double.xmax, -1, -1)) +
+                    ti(year, strata_name, sp_latin,
+                       bs = c('cr', 'mrf', 'mrf'),
+                       xt = list(list(penalty = NULL),
+                                 list(nb = strat_penalty),
+                                 list(penalty = sp_penalty)),
+                       k = c(3, 25, 25),
+                       sp = c(.Machine$double.xmax, -1, -1)),
+                  family = gaussian(),
+                  data = training_data,
+                  method = 'fREML',
+                  drop.unused.levels = FALSE,
+                  discrete = TRUE,
+                  nthreads = 12)
+runtime <- proc.time() - ptm
+gc()
+mod_bench2$runtime <- runtime
+mod_bench2 <- post_process(mod_bench2)
+saveRDS(mod_bench2, "./models/mod_bench2.rds")
 
 # Now a second model that uses functional relationships in place
 # of phylogenetic relationships
-mod2 <- bam(count ~ 
-             offset(offset) + 
+ptm <- proc.time()
+mod2 <- bam(count_sc ~ 
+             0 + 
+             n_records + 
              s(year, bs = 'cr', k = 10) +
-             s(sp_latin_func, 
-               bs = 'mrf', 
-               xt = list(penalty = func_penalty),
-               k = 20) +
-             s(ST_12, 
-               bs = 'mrf', 
-               xt = list(nb = strat_penalty),
-               k = 20) +
-             ti(year, ST_12, 
+             ti(year, strata_name, 
                 bs = c('cr', 'mrf'),
                 xt = list(list(penalty = NULL), 
                           list(nb = strat_penalty)),
-                k = c(10, 20)) +
-             ti(ST_12, sp_latin_func, 
-                bs = c('mrf', 'mrf'),
-                xt = list(list(nb = strat_penalty), 
-                          list(penalty = func_penalty)),
-                k = c(20, 20)) +
+                k = c(10, 25)) +
              ti(year, sp_latin_func, 
                 bs = c('cr', 'mrf'),
                 xt = list(list(penalty = NULL), 
                           list(penalty = func_penalty)),
-                k = c(10, 20)) +
-             ti(year, ST_12, sp_latin_func, 
+                k = c(10, 25)) +
+             ti(year, sp_latin, 
+                bs = c('cr', 'mrf'),
+                xt = list(list(penalty = NULL), 
+                          list(penalty = sp_penalty)),
+                k = c(10, 25)) +
+             ti(year, strata_name, sp_latin_func, 
                 bs = c('cr', 'mrf', 'mrf'),
                 xt = list(list(penalty = NULL),
                           list(nb = strat_penalty), 
                           list(penalty = func_penalty)),
-                k = c(10, 20, 20)),
-           rho = 0.3,
-           AR.start = mod_data$year == min(mod_data$year),
-           family = poisson(),
-           data = mod_data,
+                k = c(10, 25, 25)) +
+             ti(year, strata_name, sp_latin, 
+                bs = c('cr', 'mrf', 'mrf'),
+                xt = list(list(penalty = NULL),
+                          list(nb = strat_penalty), 
+                          list(penalty = sp_penalty)),
+                k = c(12, 25, 25)),
+           family = gaussian(),
+           data = training_data,
            method = 'fREML',
+           select = TRUE,
            drop.unused.levels = FALSE,
            discrete = TRUE,
-           nthreads = 15)
-mod2$coef_posterior <- rmvn(500,
-                           mu = coef(mod2),
-                           V = mod2$Vp)
+           nthreads = 12)
+runtime <- proc.time() - ptm
+gc()
+mod2$runtime <- runtime
+mod2 <- post_process(mod2)
 saveRDS(mod2, "./models/mod2.rds")
