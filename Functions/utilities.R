@@ -1,6 +1,31 @@
 #### Utility functions for post-processing and plotting
 # from fitted models ####
 
+#'Reduce a large gam object's size and add posterior coefficients to speed up
+#'post-processing
+#'@param model A fitted \code{gam} object
+post_process = function(model){
+  
+  # Add posterior coefficient draws for faster prediction
+  model$coef_posterior <- rmvn(500,
+                               mu = coef(model),
+                               V = model$Vp)
+  
+  # Reduce model footprint by removing slots that aren't needed for
+  # prediction
+  #model$Vc <- NULL
+  #model$Ve <- NULL
+  #model$Vp <- NULL
+  model$db.drho <- NULL
+  model$linear.predictors <- NULL
+  model$fitted.values <- NULL
+  model$control <- NULL
+  model$var.summary <- NULL
+  model$prior.weights <- NULL
+  
+  return(model)
+}
+
 #'Create a multivariate functional similarity dendrogram for species
 #'using lists of trait datasets and use this to make the MRF functional penalty
 #'
@@ -85,6 +110,67 @@ preptrait_penalty = function(trait_dfs, prep_types, ordering){
   return(penalty)
 }
 
+# Compute out of sample forecast scores against new data for fitted
+# gam / bam models
+compute_fcs <- function(model, newdata){
+  
+  # Ensure data is arranged by species then by year
+  newdata <- newdata %>%
+    dplyr::arrange(sp_latin, year)
+  
+  # Generate probabilistic predictions on the response scale
+  preds <- pred_intervals(model, 
+                          newdata = newdata, 
+                          type = 'response',
+                          summarise = FALSE)
+  
+  es_score = function(truth, idx){
+    scoringRules::es_sample(truth, 
+                            t(preds[, idx]))
+  }
+  
+  var_score = function(truth, idx){
+    scoringRules::vs_sample(truth, 
+                            t(preds[, idx]))
+  }
+  
+  # For each species * region combo, compute proper forecast scores
+  newdata %>%
+    dplyr::mutate(idx = dplyr::row_number()) %>%
+    dplyr::group_by(sp_latin, strata_name) %>%
+    dplyr::mutate(energy = es_score(count_sc, idx),
+                  variogram = var_score(count_sc, idx)) %>%
+    dplyr::ungroup() %>%
+    # Also compute an evenly-weighted combination score that considers
+    # both aspects (calibration and correlation)
+    dplyr::mutate(combo = log(energy) * log(variogram)) %>%
+    dplyr::select(sp_latin, strata_name, energy, variogram, combo) %>%
+    dplyr::distinct() -> out
+  
+  # For each timepoint, calculate the multivariate energy scores,
+  # which penalise multivariate forecasts if they are not well 
+  # calibrated (accuracy and sharpness)
+  # times <- min(newdata$year) : max(newdata$year)
+  # energies <- vector(length = length(times))
+  # variograms <- vector(length = length(times))
+  # for(t in seq_along(times)){
+  #   inds <- which(newdata$year == times[t])
+  #   if(length(inds)){
+  #     truths <- newdata$count_sc[inds]
+  #     fc_sample <- t(preds[,inds])
+  #     energies[t] <- scoringRules::es_sample(y = truths,
+  #                                            dat = fc_sample)
+  #     variograms[t] <- scoringRules::vs_sample(y = truths,
+  #                                            dat = fc_sample)
+  #   } else {
+  #     energies[t] <- NA
+  #   }
+  # }
+  # 
+  # Return the scores
+  return(out)
+}
+
 # Plot an average temporal trend (need to Roxygenise the remaining functions
 # once they are a bit further developed)
 plot_av_trend = function(model, mod_data, prop_species = 0.5){
@@ -97,7 +183,7 @@ plot_av_trend = function(model, mod_data, prop_species = 0.5){
   # Generate the datagrid
   time_dat <- datagrid(model = mod, 
                        year = unique(mod_data$year),
-                       ST_12 = unique(mod_data$ST_12),
+                       strata_name = unique(mod_data$strata_name),
                        sp_latin = sp_sample) %>%
     dplyr::mutate(sp_latin_phy = sp_latin,
                   sp_latin_func = sp_latin)
@@ -133,17 +219,41 @@ plot_av_trend = function(model, mod_data, prop_species = 0.5){
 plot_sp_trends = function(model, 
                           data = mod_data,
                           species, 
-                          regions = c('BCR5', 'BCR10',
-                                      'BCR20', 'BCR35',
-                                      'BCR15', 'BCR18',
-                                      'BCR13', 'BCR11',
-                                      'BCR26'),
+                          regions,
                           type = 'response',
                           median_records = TRUE){
+  
+  # Take the first 9 regions in which this species was recorded
+  # for default plotting
+  if(missing(regions)){
+    regions <- as.character((data %>%
+      dplyr::filter(sp_latin == !!species) %>%
+      dplyr::select(strata_name) %>%
+      dplyr::distinct() %>%
+      dplyr::pull(strata_name)))
+    if(length(regions) > 9){
+      regions <- regions[1:9]
+    }
+  }
   
   type <- match.arg(type, 
                     choices = c('expected', 'response'))
   
+  get_offset <- function(model) {
+    nm1 <- names(attributes(model$terms)$dataClasses)
+    if('(offset)' %in% nm1) {
+      deparse(as.list(model$call)$offset)
+    } else {
+      
+      sub("offset\\((.*)\\)$", "\\1", grep('offset', nm1, value = TRUE))
+    }
+  }
+  
+  offset_name <- get_offset(model)
+  if(!length(offset_name)){
+    offset_name <- 'n_records'
+  }
+
   # Use marginaleffects to create the prediction grid; if median_records = TRUE,
   # we want to ask the model what trends it would have expected if the same 
   # number of routes were taken in each region during each year. This gives a 
@@ -152,35 +262,37 @@ plot_sp_trends = function(model,
     newdata <- datagrid(model = model, 
                         year = unique(data$year),
                         sp_latin = species,
-                        ST_12 = regions) %>%
+                        strata_name = regions) %>%
       dplyr::mutate(sp_latin_phy = species,
                     sp_latin_func = species,
-                    sp_ST_12 = paste0(sp_latin, '.', ST_12)) %>%
-      dplyr::select(-count, -offset) %>%
+                    sp_strata_name = paste0(sp_latin, '.', strata_name)) %>%
+      dplyr::select(-count_sc, -{{offset_name}}) %>%
       dplyr::left_join(data) %>%
-      dplyr::group_by(sp_latin, ST_12) %>%
-      dplyr::mutate(offset = median(offset, na.rm = TRUE)) %>%
+      dplyr::group_by(sp_latin, strata_name) %>%
+      dplyr::mutate(!!offset_name := median(!!rlang::sym(offset_name), na.rm = TRUE)) %>%
       dplyr::ungroup() %>%
-      dplyr::arrange(ST_12, year)
+      dplyr::arrange(strata_name, year) %>%
+      dplyr::filter(!is.na(count))
   } else {
     # If median_records = FALSE, make predictions using the actual
     # recorded number of routes
     newdata <- datagrid(model = model, 
                         year = unique(data$year),
                         sp_latin = species,
-                        ST_12 = regions) %>%
+                        strata_name = regions) %>%
       dplyr::mutate(sp_latin_phy = species,
                     sp_latin_func = species,
-                    sp_ST_12 = paste0(sp_latin, '.', ST_12)) %>%
-      dplyr::select(-count, -offset) %>%
+                    sp_strata_name = paste0(sp_latin, '.', strata_name)) %>%
+      dplyr::select(-count_sc, -{{offset_name}}) %>%
       dplyr::left_join(data) %>%
-      dplyr::group_by(ST_12) %>%
-      dplyr::mutate(offset = ifelse(is.na(offset),
-                                       median(offset, na.rm = TRUE),
-                                       offset)) %>%
+      dplyr::group_by(strata_name) %>%
+      dplyr::mutate(!!offset_name := ifelse(is.na(!!rlang::sym(offset_name)),
+                                       median(!!rlang::sym(offset_name), na.rm = TRUE),
+                                       !!rlang::sym(offset_name))) %>%
       dplyr::ungroup() %>%
-      dplyr::filter(!is.na(offset)) %>%
-      dplyr::arrange(ST_12, year)
+      dplyr::filter(!is.na({{offset_name}})) %>%
+      dplyr::arrange(strata_name, year) %>%
+      dplyr::filter(!is.na(count))
   }
   
   # Calculate prediction intervals
@@ -196,11 +308,11 @@ plot_sp_trends = function(model,
     geom_line(linewidth = 1, alpha = 0.6) +
     geom_ribbon(aes(ymin = lower, ymax = upper),
                 alpha = 0.3, col = NA) +
-    facet_wrap(~ST_12, scales = 'free') +
+    facet_wrap(~strata_name, scales = 'free') +
     theme_classic()
   
   if(!median_records){
-    p <- p + geom_point(aes(y = count)) +
+    p <- p + geom_point(aes(y = count_sc)) +
       labs(y = paste0('Predictions for ', 
                       gsub('_', ' ', species)),
            x = 'Year')
@@ -236,7 +348,8 @@ plot_trait_conts = function(trait_derivs,
     # Filter out those with very small wiggliness estimates, as 
     # the contributions don't add any meaningful information here
     # because the estimated trend is flat
-    dplyr::filter(wiggliness >= quantile(wiggliness, probs = 0.15)) %>%
+    dplyr::filter(wiggliness >= quantile(wiggliness, probs = 0.15,
+                                         na.rm = TRUE)) %>%
     
     # Take log of remaining trait contributions and cut into bins
     dplyr::mutate(log_conts = log(trait_conts),
@@ -276,7 +389,8 @@ plot_trait_conts = function(trait_derivs,
 # Use posterior simulation to make predictions from a fitted
 # gam / bam model
 pred_intervals = function(model, newdata, type = 'link',
-                          drop_constants = FALSE){
+                          drop_constants = FALSE,
+                          summarise = TRUE){
   
   type <- match.arg(type, 
                     choices = c('expected', 'response', 'link'))
@@ -309,14 +423,24 @@ pred_intervals = function(model, newdata, type = 'link',
       all_linpreds <- rnbinom(length(all_linpreds),
                               mu = exp(all_linpreds),
                               size = mod$family$getTheta(TRUE))
-    } else {
+    } else if(grepl('poisson', model$family$family)){
       all_linpreds <- rpois(length(all_linpreds),
                             lambda = exp(all_linpreds))
+    } else {
+      all_linpreds <- rnorm(length(all_linpreds),
+                            mean = all_linpreds,
+                            sd = sqrt(mod$sig2))
     }
   }
   
   if(type == 'expected'){
-    all_linpreds <- exp(all_linpreds)
+    if(grepl('Negative Binomial', model$family$family)){
+      all_linpreds <- exp(all_linpreds)
+    } else if(grepl('poisson', model$family$family)){
+      all_linpreds <- exp(all_linpreds)
+    } else {
+      all_linpreds <- all_linpreds
+    }
   }
   
   # Convert predictions back to matrix form, calculate quantiles
@@ -324,32 +448,41 @@ pred_intervals = function(model, newdata, type = 'link',
   all_linpreds <- matrix(all_linpreds, 
                          nrow = nrow(betas),
                          byrow = FALSE)
-  creds <- apply(all_linpreds, 2, 
-                 function(x) 
-                   quantile(x, probs = c(0.025, 0.5, 0.975)))
-  return(list(mean = creds[2,],
-              upper = creds[3,],
-              lower = creds[1,]))
+  if(summarise){
+    creds <- apply(all_linpreds, 2, 
+                   function(x) 
+                     quantile(x, probs = c(0.025, 0.5, 0.975),
+                              na.rm = TRUE))
+    out <- list(mean = creds[2,],
+                upper = creds[3,],
+                lower = creds[1,])
+  } else {
+    out <- all_linpreds
+  }
+
+  gc()
+  return(out)
 }
 
-# Compute squared second derivatives of estimated trends for each 
+# Compute variation of estimated trends for each 
 # species / region combination and calculate how much the trait information
 # contributes to these estimates
 compute_derivs = function(data, 
                           model, 
                           type = 'phylogenetic', 
-                          n_cores = 4){
-  n_species <- length(levels(data$sp_latin))
+                          n_cores = 4,
+                          pred_vars = TRUE){
+  n_species <- nlevels(data$sp_latin)
   term_of_interest <- switch(type,
                              'phylogenetic' = 'phy',
                              'functional' = 'func')
   
   # First create the newdata grids so we don't have to send all of the 
   # data to each cluster; we want to predict at the regions where this species
-  # has been recorded, and use a grid of years to allow for more precise estimates
-  # of second derivatives
+  # has been recorded, and use a fine grid of "years" to allow for more precise estimates
+  # of second derivatives with finite differencing
   which_STs <- data %>%
-    dplyr::group_by(sp_latin, ST_12) %>%
+    dplyr::group_by(sp_latin, strata_name) %>%
     dplyr::mutate(recorded = dplyr::case_when(
       any(count > 0) ~ 1,
       TRUE ~ 0
@@ -357,7 +490,7 @@ compute_derivs = function(data,
     dplyr::ungroup() %>%
     dplyr::filter(recorded == 1) %>%
     dplyr::group_by(sp_latin) %>%
-    dplyr::summarise(which_ST = list(unique(ST_12)))
+    dplyr::summarise(which_ST = list(unique(strata_name)))
   years <- seq(from = min(data$year), 
                to = max(data$year), 
                by = 0.25)
@@ -367,9 +500,12 @@ compute_derivs = function(data,
   # is slow, partly because of the memory overhead to send the huge model object
   # to each node; but I can't think of a better way to do this at present. As a start
   # we can reduce the size of the model object by eliminating things that aren't needed
-  # for prediction
+  # for point-based predictions
   model$residuals <- NULL
   model$coef_posterior <- NULL
+  model$linear.predictors <- NULL
+  model$fitted.values <- NULL
+  model$control <- NULL
   model$var.summary <- NULL
   model$prior.weights <- NULL
   model$R <- NULL
@@ -377,6 +513,7 @@ compute_derivs = function(data,
   model$Vp <- NULL
   model$Vc <- NULL
   model$Ve <- NULL
+  model$edf <- NULL
 
   cl <- parallel::makePSOCKcluster(n_cores)
   parallel::setDefaultCluster(cl)
@@ -384,16 +521,21 @@ compute_derivs = function(data,
   parallel::clusterExport(NULL, c('years',
                                   'species',
                                   'model',
-                                  'which_STs'),
+                                  'which_STs',
+                                  'term_of_interest',
+                                  'pred_vars'),
                           envir = environment())
   parallel::clusterEvalQ(cl = cl, library(marginaleffects))
   parallel::clusterEvalQ(cl = cl, library(dplyr))
   parallel::clusterEvalQ(cl = cl, library(mgcv))
   
-  # Create newdata grids for each species and send them to each node
+  # Create newdata grids for each species and send them to each node;
+  # using datagrid() from marginaleffects will ensure that the sampling effort
+  # (offset variable) will be the same in each year for a given species, allowing
+  # us to get a better sense of the overall nonlinear expected trend
   newdat_grids <- pbapply::pblapply(seq_len(n_species), function(x){
     datagrid(sp_latin = species[x],
-             ST_12 = which_STs$which_ST[x][[1]],
+             strata_name = which_STs$which_ST[x][[1]],
              year = years,
              model = model) %>%
       dplyr::mutate(sp_latin_phy = sp_latin,
@@ -418,25 +560,37 @@ compute_derivs = function(data,
                                                   colnames(sp_preds))
                              
                              # For each region-specific time series, 
-                             # compute the squared second derivative
-                             # trends composed of trait and non-trait terms
-                             unique_STs <- unique(newdat_grids[[x]]$ST_12)
+                             # compute either the squared second derivative of
+                             # trends composed of trait and non-trait term predictions (if pred_vars = FALSE)
+                             # or the variances of the trait and non-trait predictions
+                             unique_STs <- unique(newdat_grids[[x]]$strata_name)
                              wiggliness <- vector(length = length(unique_STs))
                              trait_conts <- vector(length = length(unique_STs))
                              nontrait_conts <- vector(length = length(unique_STs))
                              for(i in 1:length(unique_STs)){
-                               inds <- which(newdat_grids[[x]]$ST_12 == 
+                               inds <- which(newdat_grids[[x]]$strata_name == 
                                                unique_STs[i])
-                               trait_conts[i] <- sum(diff(diff(rowSums(sp_preds[inds, 
-                                                                                trait_terms]))) ^ 2)
-                               nontrait_conts[i] <- sum(diff(diff(rowSums(sp_preds[inds, 
-                                                                                   !trait_terms]))) ^ 2)
-                               wiggliness[i] <- sum(diff(diff(rowSums(sp_preds[inds, ]))) ^ 2)
-                               
+                               if(!pred_vars){
+                                 trait_conts[i] <- sum(diff(diff(rowSums(sp_preds[inds, 
+                                                                                  trait_terms,
+                                                                                  drop = FALSE]))) ^ 2)
+                                 nontrait_conts[i] <- sum(diff(diff(rowSums(sp_preds[inds, 
+                                                                                     !trait_terms,
+                                                                                     drop = FALSE]))) ^ 2)
+                                 wiggliness[i] <- sum(diff(diff(rowSums(sp_preds[inds, ]))) ^ 2)
+                               } else {
+                                 trait_conts[i] <- var(rowSums(sp_preds[inds, 
+                                                                        trait_terms,
+                                                                        drop = FALSE]))
+                                 nontrait_conts[i] <- var(rowSums(sp_preds[inds, 
+                                                                           !trait_terms,
+                                                                           drop = FALSE]))
+                                 wiggliness[i] <- var(rowSums(sp_preds[inds, ]))
+                               }
                                }
                              
                              data.frame(sp_latin = levels(data$sp_latin)[x],
-                                        ST_12 = unique_STs,
+                                        strata_name = unique_STs,
                                         wiggliness = wiggliness,
                                         trait_conts = trait_conts / nontrait_conts)
                            }, cl = cl))
